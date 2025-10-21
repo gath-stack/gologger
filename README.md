@@ -4,6 +4,8 @@ This package provides a unified, high-performance, and production-ready structur
 
 The package is built on top of **Uber's [zap](https://github.com/uber-go/zap)** library, providing both structured JSON logging for production environments and colorized console logging for local development.
 
+It can be also used combined with gobservability.
+
 ---
 
 ## Overview
