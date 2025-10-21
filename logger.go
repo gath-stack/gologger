@@ -382,3 +382,58 @@ func Fatal(msg string, fields ...zap.Field) {
 func WithFields(fields ...zap.Field) *Logger {
 	return Get().WithContext(fields...)
 }
+
+// UnderlyingLogger returns the underlying zap.Logger for advanced integrations.
+//
+// This is useful when you need direct access to the zap.Logger for
+// advanced features like OTLP log export or custom cores.
+//
+// Example:
+//
+//	log := logger.Get()
+//	zapLogger := log.UnderlyingLogger()
+//	// Use zapLogger for advanced operations
+func (l *Logger) UnderlyingLogger() *zap.Logger {
+	return l.Logger
+}
+
+// ReplaceCore replaces the logger's core with a new one.
+//
+// This is useful for adding additional outputs (like OTLP) while
+// maintaining the existing logger configuration.
+//
+// Example:
+//
+//	log := logger.Get()
+//	currentCore := log.UnderlyingLogger().Core()
+//	otelCore := createOTELCore()
+//	teeCore := zapcore.NewTee(currentCore, otelCore)
+//	log.ReplaceCore(teeCore)
+func (l *Logger) ReplaceCore(core zapcore.Core) {
+	// Create new logger with the new core, preserving options
+	newLogger := zap.New(core,
+		zap.AddCaller(),
+		zap.AddCallerSkip(1),
+		zap.AddStacktrace(zapcore.ErrorLevel),
+	)
+
+	// Replace the underlying logger
+	l.Logger = newLogger
+}
+
+// WithOTELCore creates a new logger that sends logs to both console and OTLP.
+//
+// This is a convenience method for adding OTLP export to the logger.
+// The returned logger will write to both the original output and OTLP.
+//
+// Example:
+//
+//	log := logger.Get()
+//	otelCore := createOTELCore()
+//	log.WithOTELCore(otelCore)
+//	log.Info("This goes to both console and Loki")
+func (l *Logger) WithOTELCore(otelCore zapcore.Core) {
+	currentCore := l.Logger.Core()
+	teeCore := zapcore.NewTee(currentCore, otelCore)
+	l.ReplaceCore(teeCore)
+}
