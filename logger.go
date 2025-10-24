@@ -14,36 +14,40 @@
 //   - Colorized console output in development for easier debugging.
 //   - Global singleton logger for simple application-wide access.
 //   - Contextual field injection for structured log enrichment.
-//   - Strict configuration validation to prevent runtime issues in production.
+//   - Configuration managed by the config package for centralized validation.
 //
 // Example usage:
 //
 //	func main() {
-//	    cfg, err := logger.FromEnv()
-//	    if err != nil {
-//	        panic(fmt.Sprintf("invalid logger configuration: %v", err))
-//	    }
-//	    if err := logger.InitGlobal(cfg); err != nil {
-//	        panic(fmt.Sprintf("failed to initialize logger: %v", err))
-//	    }
+//	    logger.MustInitFromEnv()
 //	    defer logger.Get().Sync()
 //
 //	    log := logger.Get()
 //	    log.Info("application started", zap.String("version", "1.0.0"))
 //	}
 //
+// Alternative with error handling:
+//
+//	func main() {
+//	    if err := logger.InitFromEnv(); err != nil {
+//	        log.Fatalf("failed to initialize logger: %v", err)
+//	    }
+//	    defer logger.Get().Sync()
+//
+//	    logger.Info("application started")
+//	}
+//
 // Production recommendations:
-//   - Always initialize the global logger early in application startup.
-//   - In production, prefer JSON encoding for structured log ingestion.
+//   - Always initialize the global logger early in application startup using MustInitFromEnv().
+//   - In production, prefer JSON encoding for structured log ingestion (set APP_ENV=production).
 //   - Call `Sync()` before process exit to flush any buffered log entries.
-//   - Ensure all required environment variables are set before starting the application.
+//   - Ensure all required environment variables (LOG_LEVEL, APP_ENV, APP_NAME) are set.
 package logger
 
 import (
-	"errors"
 	"fmt"
-	"os"
-	"strings"
+
+	"github.com/gath-stack/gologger/internal/config"
 
 	"go.uber.org/zap"
 	"go.uber.org/zap/zapcore"
@@ -57,120 +61,44 @@ type Logger struct {
 	*zap.Logger
 }
 
-// LogLevel represents the verbosity level for the logger.
-type LogLevel string
-
-const (
-	// LevelDebug enables detailed debug and above level logging.
-	LevelDebug LogLevel = "DEBUG"
-	// LevelInfo enables informational and above level logging (default).
-	LevelInfo LogLevel = "INFO"
-	// LevelWarn enables warning and above level logging.
-	LevelWarn LogLevel = "WARN"
-	// LevelError enables error level logging only.
-	LevelError LogLevel = "ERROR"
-)
-
-// Environment represents the deployment environment.
-type Environment string
-
-const (
-	EnvDevelopment Environment = "development"
-	EnvProduction  Environment = "production"
-)
-
 var (
 	// globalLogger is the shared singleton logger instance for the application.
 	globalLogger *Logger
-
-	// ErrInvalidLogLevel is returned when an unsupported log level is provided.
-	ErrInvalidLogLevel = errors.New("invalid log level: must be DEBUG, INFO, WARN, or ERROR")
-
-	// ErrInvalidEnvironment is returned when an unsupported environment is provided.
-	ErrInvalidEnvironment = errors.New("invalid environment: must be 'development' or 'production'")
-
-	// ErrMissingServiceName is returned when the service name is empty.
-	ErrMissingServiceName = errors.New("service name is required and cannot be empty")
-
-	// ErrMissingRequiredEnvVar is returned when a required environment variable is not set.
-	ErrMissingRequiredEnvVar = errors.New("required environment variable is not set")
 )
-
-// Config defines the configuration parameters for the logger.
-//
-// All fields are validated before creating a logger instance.
-type Config struct {
-	Level       LogLevel
-	Environment Environment
-	ServiceName string
-}
-
-// Validate checks if the configuration is valid for production use.
-//
-// Returns an error if any required field is missing or contains invalid values.
-func (c Config) Validate() error {
-	// Validate log level
-	switch c.Level {
-	case LevelDebug, LevelInfo, LevelWarn, LevelError:
-		// Valid
-	default:
-		return fmt.Errorf("%w: got '%s'", ErrInvalidLogLevel, c.Level)
-	}
-
-	// Validate environment
-	switch c.Environment {
-	case EnvDevelopment, EnvProduction:
-		// Valid
-	default:
-		return fmt.Errorf("%w: got '%s'", ErrInvalidEnvironment, c.Environment)
-	}
-
-	// Validate service name
-	if strings.TrimSpace(c.ServiceName) == "" {
-		return ErrMissingServiceName
-	}
-
-	return nil
-}
 
 // New creates a new logger instance according to the given configuration.
 //
-// The configuration is validated before creating the logger. If validation fails,
-// an error is returned and the application should not proceed.
+// The configuration should come from the config package and will be validated
+// by that package before being passed here.
 //
 // In production mode, logs are formatted as structured JSON suitable for ingestion by Loki,
 // FluentBit, or Elasticsearch. In development mode, logs use a colorized console encoder.
 //
 // Example:
 //
-//	logger, err := logger.New(logger.Config{
-//	    Level:       logger.LevelDebug,
-//	    Environment: logger.EnvProduction,
-//	    ServiceName: "api-service",
-//	})
+//	cfg := config.MustLoad()
+//	logger, err := logger.New(cfg.Logger)
 //	if err != nil {
 //	    panic(err)
 //	}
-func New(cfg Config) (*Logger, error) {
-	// Validate configuration first
-	if err := cfg.Validate(); err != nil {
-		return nil, fmt.Errorf("invalid logger configuration: %w", err)
-	}
+func New(cfg LoggerConfig) (*Logger, error) {
+	// Note: validation is handled by the config package
+	// We can assume cfg is already validated when it reaches here
 
 	var zapLevel zapcore.Level
 
-	// Map custom log levels to zap internal levels
+	// Map config log levels to zap internal levels
 	switch cfg.Level {
-	case LevelDebug:
+	case LogLevelDebug:
 		zapLevel = zapcore.DebugLevel
-	case LevelInfo:
+	case LogLevelInfo:
 		zapLevel = zapcore.InfoLevel
-	case LevelWarn:
+	case LogLevelWarn:
 		zapLevel = zapcore.WarnLevel
-	case LevelError:
+	case LogLevelError:
 		zapLevel = zapcore.ErrorLevel
 	default:
-		// This should never happen due to validation, but included for safety
+		// Default to info level as a safe fallback
 		zapLevel = zapcore.InfoLevel
 	}
 
@@ -256,9 +184,8 @@ func developmentEncoderConfig() zapcore.EncoderConfig {
 // This should be called during application startup to make the logger globally accessible.
 // It replaces any existing global logger instance.
 //
-// The configuration is validated before initialization. If validation fails, an error
-// is returned and the application should terminate.
-func InitGlobal(cfg Config) error {
+// The configuration should come from the config package, which handles all validation.
+func InitGlobal(cfg LoggerConfig) error {
 	logger, err := New(cfg)
 	if err != nil {
 		return err
@@ -286,57 +213,6 @@ func Get() *Logger {
 //	log.Info("User login succeeded")
 func (l *Logger) WithContext(fields ...zap.Field) *Logger {
 	return &Logger{Logger: l.With(fields...)}
-}
-
-// FromEnv builds a logger configuration using environment variables.
-//
-// Required environment variables:
-//   - LOG_LEVEL: sets log level (DEBUG, INFO, WARN, ERROR)
-//   - APP_ENV: defines environment ("development" or "production")
-//   - APP_NAME: sets the service name field
-//
-// Returns an error if any required variable is missing or invalid.
-// The application should not start if this function returns an error.
-func FromEnv() (Config, error) {
-	logLevel := os.Getenv("LOG_LEVEL")
-	if logLevel == "" {
-		return Config{}, fmt.Errorf("%w: LOG_LEVEL", ErrMissingRequiredEnvVar)
-	}
-
-	appEnv := os.Getenv("APP_ENV")
-	if appEnv == "" {
-		return Config{}, fmt.Errorf("%w: APP_ENV", ErrMissingRequiredEnvVar)
-	}
-
-	appName := os.Getenv("APP_NAME")
-	if appName == "" {
-		return Config{}, fmt.Errorf("%w: APP_NAME", ErrMissingRequiredEnvVar)
-	}
-
-	cfg := Config{
-		Level:       LogLevel(strings.ToUpper(logLevel)),
-		Environment: Environment(strings.ToLower(appEnv)),
-		ServiceName: appName,
-	}
-
-	// Validate the configuration before returning
-	if err := cfg.Validate(); err != nil {
-		return Config{}, err
-	}
-
-	return cfg, nil
-}
-
-// MustFromEnv builds a logger configuration from environment variables.
-//
-// Panics if any required variable is missing or invalid.
-// Use this in main() for fail-fast behavior on startup.
-func MustFromEnv() Config {
-	cfg, err := FromEnv()
-	if err != nil {
-		panic(fmt.Sprintf("failed to load logger configuration from environment: %v", err))
-	}
-	return cfg
 }
 
 // Sync flushes any buffered log entries to the underlying writer.
@@ -436,4 +312,55 @@ func (l *Logger) WithOTELCore(otelCore zapcore.Core) {
 	currentCore := l.Logger.Core()
 	teeCore := zapcore.NewTee(currentCore, otelCore)
 	l.ReplaceCore(teeCore)
+}
+
+// InitFromEnv initializes the global logger using environment variables.
+//
+// This is a convenience function that loads configuration from environment
+// and initializes the logger in one call. It's the recommended way to
+// initialize the logger in main().
+//
+// Required environment variables:
+//   - LOG_LEVEL: DEBUG, INFO, WARN, ERROR
+//   - APP_ENV: development, production
+//   - APP_NAME: your service name
+//
+// Returns an error if any required variable is missing or invalid.
+//
+// Example:
+//
+//	if err := logger.InitFromEnv(); err != nil {
+//	    log.Fatalf("failed to initialize logger: %v", err)
+//	}
+//	defer logger.Get().Sync()
+func InitFromEnv() error {
+	cfg, err := config.Load()
+	if err != nil {
+		return fmt.Errorf("failed to load configuration: %w", err)
+	}
+	return InitGlobal(cfg.Logger)
+}
+
+// MustInitFromEnv initializes the global logger using environment variables.
+//
+// This function panics if initialization fails. Use this in main() for
+// fail-fast behavior during application startup.
+//
+// Required environment variables:
+//   - LOG_LEVEL: DEBUG, INFO, WARN, ERROR
+//   - APP_ENV: development, production
+//   - APP_NAME: your service name
+//
+// Example:
+//
+//	func main() {
+//	    logger.MustInitFromEnv()
+//	    defer logger.Get().Sync()
+//
+//	    logger.Info("application started")
+//	}
+func MustInitFromEnv() {
+	if err := InitFromEnv(); err != nil {
+		panic(fmt.Sprintf("failed to initialize logger from environment: %v", err))
+	}
 }
