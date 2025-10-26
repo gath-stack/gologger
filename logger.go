@@ -1,149 +1,74 @@
-// Package logger initializes and manages structured logging for the application.
+// Package logger provides a structured logging wrapper around Uber's Zap logger.
 //
-// This package provides a unified and high-performance logging abstraction built on top of
-// Uber's zap library. It supports both human-readable console logs (for development)
-// and JSON-formatted structured logs (for production), which can be directly ingested
-// by observability backends such as Loki or Elasticsearch.
+// This package offers a production-ready logging solution with:
+//   - Environment-based configuration (development/production)
+//   - Structured logging with strongly-typed fields
+//   - Global logger instance with thread-safe initialization
+//   - Convenient package-level functions
+//   - Support for contextual loggers with pre-attached fields
+//   - Integration-friendly design with OTEL support
 //
-// The logger is environment-aware, with configurable log levels and output encoders,
-// and supports both global and contextual loggers for flexible usage across modules.
-//
-// Key features:
-//   - Fast, structured, leveled logging using zap.
-//   - JSON output in production for seamless integration with Loki and other log pipelines.
-//   - Colorized console output in development for easier debugging.
-//   - Global singleton logger for simple application-wide access.
-//   - Contextual field injection for structured log enrichment.
-//   - Configuration managed by the config package for centralized validation.
-//
-// Example usage:
+// Basic usage:
 //
 //	func main() {
 //	    logger.MustInitFromEnv()
-//	    defer logger.Get().Sync()
-//
-//	    log := logger.Get()
-//	    log.Info("application started", zap.String("version", "1.0.0"))
-//	}
-//
-// Alternative with error handling:
-//
-//	func main() {
-//	    if err := logger.InitFromEnv(); err != nil {
-//	        log.Fatalf("failed to initialize logger: %v", err)
-//	    }
-//	    defer logger.Get().Sync()
+//	    defer logger.Sync()
 //
 //	    logger.Info("application started")
 //	}
 //
-// Production recommendations:
-//   - Always initialize the global logger early in application startup using MustInitFromEnv().
-//   - In production, prefer JSON encoding for structured log ingestion (set APP_ENV=production).
-//   - Call `Sync()` before process exit to flush any buffered log entries.
-//   - Ensure all required environment variables (LOG_LEVEL, APP_ENV, APP_NAME) are set.
+// With contextual fields:
+//
+//	log := logger.With(
+//	    zap.String("component", "auth"),
+//	    zap.String("user_id", "12345"),
+//	)
+//	log.Info("user authenticated")
 package logger
 
 import (
+	"errors"
 	"fmt"
+	"os"
+	"strings"
+	"sync"
+	"syscall"
+	"time"
 
 	"github.com/gath-stack/gologger/internal/config"
-
 	"go.uber.org/zap"
 	"go.uber.org/zap/zapcore"
 )
 
-// Logger wraps zap.Logger to provide application-specific structured logging functionality.
-//
-// It supports contextual enrichment via `WithContext()` and integrates with the
-// global logger pattern used throughout the application.
+// Logger wraps zap.Logger to provide additional functionality.
 type Logger struct {
 	*zap.Logger
 }
 
 var (
-	// globalLogger is the shared singleton logger instance for the application.
 	globalLogger *Logger
+	mu           sync.RWMutex
 )
 
-// New creates a new logger instance according to the given configuration.
-//
-// The configuration should come from the config package and will be validated
-// by that package before being passed here.
-//
-// In production mode, logs are formatted as structured JSON suitable for ingestion by Loki,
-// FluentBit, or Elasticsearch. In development mode, logs use a colorized console encoder.
-//
-// Example:
-//
-//	cfg := config.MustLoad()
-//	logger, err := logger.New(cfg.Logger)
-//	if err != nil {
-//	    panic(err)
-//	}
-func New(cfg LoggerConfig) (*Logger, error) {
-	// Note: validation is handled by the config package
-	// We can assume cfg is already validated when it reaches here
-
-	var zapLevel zapcore.Level
-
-	// Map config log levels to zap internal levels
+// buildLogger constructs a zap.Logger based on the provided configuration.
+func buildLogger(cfg config.LoggerConfig) (*zap.Logger, error) {
+	// Parse log level
+	var level zapcore.Level
 	switch cfg.Level {
-	case LogLevelDebug:
-		zapLevel = zapcore.DebugLevel
-	case LogLevelInfo:
-		zapLevel = zapcore.InfoLevel
-	case LogLevelWarn:
-		zapLevel = zapcore.WarnLevel
-	case LogLevelError:
-		zapLevel = zapcore.ErrorLevel
+	case config.LogLevelDebug:
+		level = zapcore.DebugLevel
+	case config.LogLevelInfo:
+		level = zapcore.InfoLevel
+	case config.LogLevelWarn:
+		level = zapcore.WarnLevel
+	case config.LogLevelError:
+		level = zapcore.ErrorLevel
 	default:
-		// Default to info level as a safe fallback
-		zapLevel = zapcore.InfoLevel
+		return nil, fmt.Errorf("%w: %s", ErrInvalidLogLevel, cfg.Level)
 	}
 
-	var zapConfig zap.Config
-	if cfg.Environment == EnvProduction {
-		zapConfig = zap.Config{
-			Level:            zap.NewAtomicLevelAt(zapLevel),
-			Development:      false,
-			Encoding:         "json",
-			EncoderConfig:    productionEncoderConfig(),
-			OutputPaths:      []string{"stdout"},
-			ErrorOutputPaths: []string{"stderr"},
-		}
-	} else {
-		zapConfig = zap.Config{
-			Level:            zap.NewAtomicLevelAt(zapLevel),
-			Development:      true,
-			Encoding:         "console",
-			EncoderConfig:    developmentEncoderConfig(),
-			OutputPaths:      []string{"stdout"},
-			ErrorOutputPaths: []string{"stderr"},
-		}
-	}
-
-	zapLogger, err := zapConfig.Build(
-		zap.AddCallerSkip(1),
-		zap.AddStacktrace(zapcore.ErrorLevel),
-	)
-	if err != nil {
-		return nil, fmt.Errorf("failed to build logger: %w", err)
-	}
-
-	zapLogger = zapLogger.With(
-		zap.String("service", cfg.ServiceName),
-		zap.String("environment", string(cfg.Environment)),
-	)
-
-	return &Logger{Logger: zapLogger}, nil
-}
-
-// productionEncoderConfig defines the encoder settings for production JSON logs.
-//
-// The output schema is compatible with Loki and other structured logging systems.
-func productionEncoderConfig() zapcore.EncoderConfig {
-	return zapcore.EncoderConfig{
+	// Build encoder config
+	encoderConfig := zapcore.EncoderConfig{
 		TimeKey:        "timestamp",
 		LevelKey:       "level",
 		NameKey:        "logger",
@@ -157,69 +82,174 @@ func productionEncoderConfig() zapcore.EncoderConfig {
 		EncodeDuration: zapcore.SecondsDurationEncoder,
 		EncodeCaller:   zapcore.ShortCallerEncoder,
 	}
+
+	// Choose encoder based on environment
+	var encoder zapcore.Encoder
+	if cfg.Environment == config.EnvProduction {
+		encoder = zapcore.NewJSONEncoder(encoderConfig)
+	} else {
+		encoderConfig.EncodeLevel = zapcore.CapitalColorLevelEncoder
+		encoder = zapcore.NewConsoleEncoder(encoderConfig)
+	}
+
+	// Create core
+	core := zapcore.NewCore(
+		encoder,
+		zapcore.AddSync(os.Stdout),
+		level,
+	)
+
+	// Build logger with options
+	logger := zap.New(core,
+		zap.AddCaller(),
+		zap.AddCallerSkip(1),
+		zap.AddStacktrace(zapcore.ErrorLevel),
+		zap.Fields(zap.String("service", cfg.ServiceName)),
+	)
+
+	return logger, nil
 }
 
-// developmentEncoderConfig defines the encoder settings for development console logs.
-//
-// The output is colorized and human-readable for local debugging convenience.
-func developmentEncoderConfig() zapcore.EncoderConfig {
-	return zapcore.EncoderConfig{
-		TimeKey:        "T",
-		LevelKey:       "L",
-		NameKey:        "N",
-		CallerKey:      "C",
-		FunctionKey:    zapcore.OmitKey,
-		MessageKey:     "M",
-		StacktraceKey:  "S",
-		LineEnding:     zapcore.DefaultLineEnding,
-		EncodeLevel:    zapcore.CapitalColorLevelEncoder,
-		EncodeTime:     zapcore.ISO8601TimeEncoder,
-		EncodeDuration: zapcore.StringDurationEncoder,
-		EncodeCaller:   zapcore.ShortCallerEncoder,
+// validateConfig validates the logger configuration.
+func validateConfig(cfg config.LoggerConfig) error {
+	if err := cfg.Level.Validate(); err != nil {
+		return fmt.Errorf("%w: %v", ErrInvalidLogLevel, err)
 	}
-}
-
-// InitGlobal initializes the global singleton logger.
-//
-// This should be called during application startup to make the logger globally accessible.
-// It replaces any existing global logger instance.
-//
-// The configuration should come from the config package, which handles all validation.
-func InitGlobal(cfg LoggerConfig) error {
-	logger, err := New(cfg)
-	if err != nil {
-		return err
+	if err := cfg.Environment.Validate(); err != nil {
+		return fmt.Errorf("%w: %v", ErrInvalidEnvironment, err)
 	}
-	globalLogger = logger
+	if strings.TrimSpace(cfg.ServiceName) == "" {
+		return ErrMissingServiceName
+	}
 	return nil
 }
 
-// Get retrieves the global logger instance.
+// InitGlobal initializes the global logger with the provided configuration.
 //
-// Panics if no global logger has been initialized via InitGlobal().
-// This is intentional to catch configuration errors early in production environments.
+// This function can only be called once. Subsequent calls will return
+// ErrAlreadyInitialized. The initialization is thread-safe.
+//
+// Example:
+//
+//	cfg := logger.LoggerConfig{
+//	    Level:       logger.LogLevelInfo,
+//	    Environment: logger.EnvProduction,
+//	    ServiceName: "my-service",
+//	}
+//	if err := logger.InitGlobal(cfg); err != nil {
+//	    log.Fatalf("failed to initialize logger: %v", err)
+//	}
+func InitGlobal(cfg config.LoggerConfig) error {
+	mu.Lock()
+	defer mu.Unlock()
+
+	// Check if already initialized
+	if globalLogger != nil {
+		return ErrAlreadyInitialized
+	}
+
+	// Validate config
+	if err := validateConfig(cfg); err != nil {
+		return fmt.Errorf("%w: %v", ErrInvalidConfig, err)
+	}
+
+	// Build logger
+	zapLogger, err := buildLogger(cfg)
+	if err != nil {
+		return fmt.Errorf("failed to build logger: %w", err)
+	}
+
+	globalLogger = &Logger{Logger: zapLogger}
+	return nil
+}
+
+// Get returns the global logger instance.
+//
+// This function panics if the logger has not been initialized.
+// Use TryGet() for a non-panicking version.
+//
+// Example:
+//
+//	log := logger.Get()
+//	log.Info("application started")
 func Get() *Logger {
+	mu.RLock()
+	defer mu.RUnlock()
 	if globalLogger == nil {
-		panic("logger not initialized: call logger.InitGlobal() during application startup")
+		panic(ErrNotInitialized)
 	}
 	return globalLogger
 }
 
-// WithContext returns a derived logger enriched with additional structured fields.
+// TryGet returns the global logger instance and an error if not initialized.
+//
+// This is a non-panicking alternative to Get() that is useful in library code
+// or when you want to handle the uninitialized case gracefully.
 //
 // Example:
 //
-//	log := logger.Get().WithContext(zap.String("user_id", "abc123"))
+//	log, err := logger.TryGet()
+//	if err != nil {
+//	    if errors.Is(err, logger.ErrNotInitialized) {
+//	        return fmt.Errorf("logger not initialized: %w", err)
+//	    }
+//	    return err
+//	}
+//	log.Info("doing something")
+func TryGet() (*Logger, error) {
+	mu.RLock()
+	defer mu.RUnlock()
+	if globalLogger == nil {
+		return nil, ErrNotInitialized
+	}
+	return globalLogger, nil
+}
+
+// With returns a derived logger enriched with additional structured fields.
+//
+// The returned logger is a new instance and does not modify the original logger.
+//
+// Example:
+//
+//	log := logger.Get().With(zap.String("user_id", "abc123"))
 //	log.Info("User login succeeded")
-func (l *Logger) WithContext(fields ...zap.Field) *Logger {
-	return &Logger{Logger: l.With(fields...)}
+func (l *Logger) With(fields ...zap.Field) *Logger {
+	return &Logger{Logger: l.Logger.With(fields...)}
 }
 
 // Sync flushes any buffered log entries to the underlying writer.
 //
-// This should be deferred before program exit to avoid data loss.
+// This should be called before program exit to avoid data loss.
+// The function ignores known benign sync errors on stderr/stdout.
+//
+// Example:
+//
+//	defer logger.Sync()
+func Sync() error {
+	log, err := TryGet()
+	if err != nil {
+		return err
+	}
+	return log.Sync()
+}
+
+// Sync flushes any buffered log entries for this logger instance.
 func (l *Logger) Sync() error {
-	return l.Logger.Sync()
+	if err := l.Logger.Sync(); err != nil {
+		// Ignore known benign sync errors on stderr/stdout
+		if !isIgnorableSyncError(err) {
+			return fmt.Errorf("%w: %v", ErrSyncFailed, err)
+		}
+	}
+	return nil
+}
+
+// isIgnorableSyncError returns true for sync errors that can be safely ignored.
+// Zap can fail on /dev/stderr in some operating systems.
+func isIgnorableSyncError(err error) bool {
+	return errors.Is(err, syscall.EINVAL) ||
+		errors.Is(err, syscall.ENOTTY) ||
+		errors.Is(err, syscall.EBADF)
 }
 
 // Debug logs a message at the DEBUG level using the global logger.
@@ -249,20 +279,21 @@ func Fatal(msg string, fields ...zap.Field) {
 	Get().Fatal(msg, fields...)
 }
 
-// WithFields creates a derived logger with pre-attached structured fields using the global logger.
+// With creates a derived logger with pre-attached structured fields using the global logger.
 //
 // Example:
 //
-//	log := logger.WithFields(zap.String("component", "auth"))
+//	log := logger.With(zap.String("component", "auth"))
 //	log.Info("Authentication service started")
-func WithFields(fields ...zap.Field) *Logger {
-	return Get().WithContext(fields...)
+func With(fields ...zap.Field) *Logger {
+	return Get().With(fields...)
 }
 
 // UnderlyingLogger returns the underlying zap.Logger for advanced integrations.
 //
-// This is useful when you need direct access to the zap.Logger for
-// advanced features like OTLP log export or custom cores.
+// UNSTABLE API: This method exposes internal implementation details and may
+// change in future versions. Use only when you need direct access to zap.Logger
+// for advanced features like OTLP log export or custom cores.
 //
 // Example:
 //
@@ -273,10 +304,13 @@ func (l *Logger) UnderlyingLogger() *zap.Logger {
 	return l.Logger
 }
 
-// ReplaceCore replaces the logger's core with a new one.
+// WithCore creates a new logger with the specified core.
 //
-// This is useful for adding additional outputs (like OTLP) while
-// maintaining the existing logger configuration.
+// UNSTABLE API: This method is for advanced use cases and may change.
+// Use this when you need to replace or wrap the logger's core, such as
+// adding additional outputs (like OTLP) while maintaining existing configuration.
+//
+// The returned logger is a new instance with the new core.
 //
 // Example:
 //
@@ -284,21 +318,20 @@ func (l *Logger) UnderlyingLogger() *zap.Logger {
 //	currentCore := log.UnderlyingLogger().Core()
 //	otelCore := createOTELCore()
 //	teeCore := zapcore.NewTee(currentCore, otelCore)
-//	log.ReplaceCore(teeCore)
-func (l *Logger) ReplaceCore(core zapcore.Core) {
-	// Create new logger with the new core, preserving options
+//	newLog := log.WithCore(teeCore)
+//	newLog.Info("This goes to both console and OTLP")
+func (l *Logger) WithCore(core zapcore.Core) *Logger {
 	newLogger := zap.New(core,
 		zap.AddCaller(),
 		zap.AddCallerSkip(1),
 		zap.AddStacktrace(zapcore.ErrorLevel),
 	)
-
-	// Replace the underlying logger
-	l.Logger = newLogger
+	return &Logger{Logger: newLogger}
 }
 
 // WithOTELCore creates a new logger that sends logs to both console and OTLP.
 //
+// UNSTABLE API: This method is for advanced use cases and may change.
 // This is a convenience method for adding OTLP export to the logger.
 // The returned logger will write to both the original output and OTLP.
 //
@@ -306,12 +339,12 @@ func (l *Logger) ReplaceCore(core zapcore.Core) {
 //
 //	log := logger.Get()
 //	otelCore := createOTELCore()
-//	log.WithOTELCore(otelCore)
-//	log.Info("This goes to both console and Loki")
-func (l *Logger) WithOTELCore(otelCore zapcore.Core) {
+//	newLog := log.WithOTELCore(otelCore)
+//	newLog.Info("This goes to both console and Loki")
+func (l *Logger) WithOTELCore(otelCore zapcore.Core) *Logger {
 	currentCore := l.Logger.Core()
 	teeCore := zapcore.NewTee(currentCore, otelCore)
-	l.ReplaceCore(teeCore)
+	return l.WithCore(teeCore)
 }
 
 // InitFromEnv initializes the global logger using environment variables.
@@ -332,7 +365,7 @@ func (l *Logger) WithOTELCore(otelCore zapcore.Core) {
 //	if err := logger.InitFromEnv(); err != nil {
 //	    log.Fatalf("failed to initialize logger: %v", err)
 //	}
-//	defer logger.Get().Sync()
+//	defer logger.Sync()
 func InitFromEnv() error {
 	cfg, err := config.Load()
 	if err != nil {
@@ -355,12 +388,72 @@ func InitFromEnv() error {
 //
 //	func main() {
 //	    logger.MustInitFromEnv()
-//	    defer logger.Get().Sync()
+//	    defer logger.Sync()
 //
 //	    logger.Info("application started")
 //	}
 func MustInitFromEnv() {
 	if err := InitFromEnv(); err != nil {
 		panic(fmt.Sprintf("failed to initialize logger from environment: %v", err))
+	}
+}
+
+// InitWithDefaults initializes the global logger with sensible defaults.
+//
+// This is useful for quick setup during development or testing.
+// Default configuration:
+//   - Level: INFO
+//   - Environment: development
+//   - ServiceName: "app"
+//
+// Example:
+//
+//	logger.InitWithDefaults()
+//	defer logger.Sync()
+func InitWithDefaults() error {
+	cfg := config.LoggerConfig{
+		Level:       config.LogLevelInfo,
+		Environment: config.EnvDevelopment,
+		ServiceName: "app",
+	}
+	return InitGlobal(cfg)
+}
+
+// SyncWithTimeout flushes log entries with a timeout.
+//
+// This is useful during graceful shutdown when you want to ensure
+// logs are flushed but don't want to wait indefinitely.
+//
+// Example:
+//
+//	if err := logger.SyncWithTimeout(5 * time.Second); err != nil {
+//	    fmt.Fprintf(os.Stderr, "sync timeout: %v\n", err)
+//	}
+func SyncWithTimeout(timeout time.Duration) error {
+	done := make(chan error, 1)
+	go func() {
+		done <- Sync()
+	}()
+
+	select {
+	case err := <-done:
+		return err
+	case <-time.After(timeout):
+		return fmt.Errorf("sync timeout after %v", timeout)
+	}
+}
+
+// SyncWithTimeout flushes log entries for this logger instance with a timeout.
+func (l *Logger) SyncWithTimeout(timeout time.Duration) error {
+	done := make(chan error, 1)
+	go func() {
+		done <- l.Sync()
+	}()
+
+	select {
+	case err := <-done:
+		return err
+	case <-time.After(timeout):
+		return fmt.Errorf("sync timeout after %v", timeout)
 	}
 }

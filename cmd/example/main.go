@@ -1,6 +1,7 @@
 package main
 
 import (
+	"errors"
 	"fmt"
 	"os"
 
@@ -14,7 +15,7 @@ func main() {
 	// This will panic if any required env var is missing or invalid
 	logger.MustInitFromEnv()
 	defer func() {
-		if err := logger.Get().Sync(); err != nil {
+		if err := logger.Sync(); err != nil {
 			fmt.Fprintf(os.Stderr, "logger sync error: %v\n", err)
 		}
 	}()
@@ -26,7 +27,7 @@ func main() {
 	)
 
 	// Example with contextual logger
-	userLogger := logger.WithFields(
+	userLogger := logger.With(
 		zap.String("component", "auth"),
 		zap.String("user_id", "12345"),
 	)
@@ -44,6 +45,15 @@ func main() {
 			zap.String("operation", "someOperation"),
 		)
 	}
+
+	// Example using TryGet (non-panicking version)
+	if log, err := logger.TryGet(); err == nil {
+		log.Info("using TryGet successfully")
+	} else {
+		if errors.Is(err, logger.ErrNotInitialized) {
+			fmt.Println("logger not initialized")
+		}
+	}
 }
 
 // Alternative: with explicit error handling instead of panic
@@ -51,15 +61,32 @@ func mainWithErrorHandling() {
 	// Initialize logger with error handling
 	if err := logger.InitFromEnv(); err != nil {
 		// Handle error - maybe use a fallback logger or exit gracefully
-		panic(err) // or handle differently
+		fmt.Fprintf(os.Stderr, "failed to initialize logger: %v\n", err)
+		os.Exit(1)
 	}
 	defer func() {
-		if err := logger.Get().Sync(); err != nil {
+		if err := logger.Sync(); err != nil {
 			fmt.Fprintf(os.Stderr, "logger sync error: %v\n", err)
 		}
 	}()
 
 	logger.Info("application started with error handling")
+}
+
+// Example: Using defaults for quick setup
+func mainWithDefaults() {
+	// Initialize with sensible defaults (useful for development)
+	if err := logger.InitWithDefaults(); err != nil {
+		fmt.Fprintf(os.Stderr, "failed to initialize logger: %v\n", err)
+		os.Exit(1)
+	}
+	defer func() {
+		if err := logger.Sync(); err != nil {
+			fmt.Fprintf(os.Stderr, "logger sync error: %v\n", err)
+		}
+	}()
+
+	logger.Info("application started with defaults")
 }
 
 func someOperation() error {
