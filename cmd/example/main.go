@@ -1,6 +1,9 @@
 package main
 
 import (
+	"fmt"
+	"os"
+
 	logger "github.com/gath-stack/gologger"
 
 	"go.uber.org/zap"
@@ -10,7 +13,11 @@ func main() {
 	// Initialize logger from environment variables
 	// This will panic if any required env var is missing or invalid
 	logger.MustInitFromEnv()
-	defer logger.Get().Sync()
+	defer func() {
+		if err := logger.Get().Sync(); err != nil {
+			fmt.Fprintf(os.Stderr, "logger sync error: %v\n", err)
+		}
+	}()
 
 	// Use the logger
 	log := logger.Get()
@@ -46,7 +53,11 @@ func mainWithErrorHandling() {
 		// Handle error - maybe use a fallback logger or exit gracefully
 		panic(err) // or handle differently
 	}
-	defer logger.Get().Sync()
+	defer func() {
+		if err := logger.Get().Sync(); err != nil {
+			fmt.Fprintf(os.Stderr, "logger sync error: %v\n", err)
+		}
+	}()
 
 	logger.Info("application started with error handling")
 }
