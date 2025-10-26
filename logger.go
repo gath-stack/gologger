@@ -457,3 +457,23 @@ func (l *Logger) SyncWithTimeout(timeout time.Duration) error {
 		return fmt.Errorf("sync timeout after %v", timeout)
 	}
 }
+
+// ReplaceGlobal replaces the global logger with a new instance.
+//
+// This is useful when you need to enhance the logger after initialization,
+// such as adding OTLP export or other integrations.
+//
+// CAUTION: This function should be used sparingly and only during application
+// startup or configuration phases. Replacing the logger during normal operation
+// may cause unexpected behavior.
+//
+// Example:
+//
+//	log := logger.Get()
+//	enhancedLog := log.WithOTELCore(otelCore)
+//	logger.ReplaceGlobal(enhancedLog)
+func ReplaceGlobal(newLogger *Logger) {
+	mu.Lock()
+	defer mu.Unlock()
+	globalLogger = newLogger
+}
